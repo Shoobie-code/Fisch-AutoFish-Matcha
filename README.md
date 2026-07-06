@@ -2,9 +2,9 @@
 Fisch Autofish for the External Matcha
 
 # This will work as long as 
-- imtheo.lol keeps offsets updated -
-- matcha working as it is now 
-- fisch not updating their catching system.
+- imtheo.lol keeps offsets updated
+  Matcha working as it is now 
+- Fisch not updating their catching system 
 
 
 # This wont be updated 
