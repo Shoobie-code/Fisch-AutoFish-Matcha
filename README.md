@@ -3,7 +3,7 @@ Fisch Autofish for the External Matcha
 
 # This will work as long as 
 - imtheo.lol keeps offsets updated
-  Matcha working as it is now 
+- Matcha luavm not changing too much
 - Fisch not updating their catching system 
 
 
