@@ -24,7 +24,7 @@ end;
 
 -- User tunables.
 local CONFIG = {
-		castMode = "long",           -- "long" | "short" | "custom" cast power
+		castMode = "short",           -- "long" | "short" | "custom" cast power
 		castPowerCustom = 96.0,      -- power % used when castMode == "custom"
 		castTimeoutMs = 12000,       -- recast/stop if a phase stalls this long
 		postCastDelayMs = 150,       -- settle after releasing a cast before shaking
