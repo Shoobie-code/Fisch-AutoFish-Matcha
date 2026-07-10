@@ -1,4 +1,4 @@
--- AutoFish for Matcha (external Roblox LuaVM) — cast / shake / reel state machine.
+-- AutoFish for Matcha (external Roblox LuaVM)  cast / shake / reel state machine.
 -- F1 toggles it. GUI state is read via memory offsets; the game is driven with input only.
 
 local Players = game:GetService("Players");
@@ -24,13 +24,15 @@ end;
 
 -- User tunables.
 local CONFIG = {
-		castMode = "short",           -- "long" | "short" | "custom" cast power
+		castMode = "short",           -- "long" | "short" (timed hold) | "custom" cast power
+		castShortHoldMs = 300,       -- short mode: release after this hold time (power reads ignored)
 		castPowerCustom = 96.0,      -- power % used when castMode == "custom"
 		castTimeoutMs = 12000,       -- recast/stop if a phase stalls this long
 		postCastDelayMs = 150,       -- settle after releasing a cast before shaking
 		postCatchDelayMs = 400,      -- wait after a catch before the next cast
 		castOnTimeout = true,        -- recast on timeout (vs. stop)
 		shakeIntervalMs = 15,        -- ms between shake key taps
+		noShakeTimeoutMs = 10000,    -- no shake prompt within this after casting -> re-equip + recast
 		completionThreshold = 99.0,  -- reel progress % that counts as a catch
 		equipSlot = 1,               -- hotbar slot the rod lives in
 	};
@@ -90,13 +92,15 @@ local function loadOffsets()
 end;
 pcall(loadOffsets);
 
--- Read a float at an address (0 on failure / bad pointer).
+-- Read a float at an address (0 on failure / bad pointer). memory_read can
+-- hand back an error STRING on a bad read (pcall still succeeds) tonumber()
+-- everything so a string can never leak into arithmetic.
 local function readFloat(addr)
 	if not addr or addr <= 4096 then
 		return .0;
 	end;
 	local ok, value = pcall(memory_read, "float", addr);
-	return (ok and value) or .0;
+	return (ok and tonumber(value)) or .0;
 end;
 
 -- Read a 32-bit int at an address (0 on failure).
@@ -108,7 +112,7 @@ local function readInt(addr)
 	if not ok then
 		ok, value = pcall(memory_read, "int", addr);
 	end;
-	return (ok and value) or 0;
+	return (ok and tonumber(value)) or 0;
 end;
 
 -- Read a single byte at an address (0 on failure).
@@ -117,7 +121,7 @@ local function readByte(addr)
 		return 0;
 	end;
 	local ok, value = pcall(memory_read, "byte", addr);
-	return (ok and value) or 0;
+	return (ok and tonumber(value)) or 0;
 end;
 
 -- Memory address of an instance, or nil if it can't be resolved.
@@ -152,7 +156,7 @@ local function readFrameSize(frame)
 	return readFloat(base + 0), readInt(base + 4), readFloat(base + 8), readInt(base + 12);
 end;
 
--- ScreenGui.Enabled — try the property, fall back to a memory read.
+-- ScreenGui.Enabled try the property, fall back to a memory read.
 local function isEnabled(gui)
 	if not gui then
 		return false;
@@ -170,7 +174,7 @@ local function isEnabled(gui)
 	return readByte(addr + OFFSETS.ScreenGuiEnabled) ~= 0;
 end;
 
--- GuiObject.Visible — try the property, fall back to a memory read.
+-- GuiObject.Visible try the property, fall back to a memory read.
 local function isVisible(gui)
 	if not gui then
 		return false;
@@ -188,9 +192,9 @@ local function isVisible(gui)
 	return readByte(addr + OFFSETS.FrameVisible) ~= 0;
 end;
 
--- True for a normal finite number (rejects NaN and ±inf).
+-- True for a normal finite number (rejects non-numbers, NaN and ±inf).
 local function isFinite(n)
-	return n == n and (n ~= math.huge and n ~= -math.huge);
+	return type(n) == "number" and n == n and (n ~= math.huge and n ~= -math.huge);
 end;
 
 -- Safe FindFirstChild.
@@ -277,7 +281,7 @@ local function tapKey(vk, holdMs)
 	end);
 end;
 
--- Tap Enter — the shake input.
+-- Tap Enter (the shake input)
 local function tapEnter()
 	tapKey(KEYS.Enter, 20);
 end;
@@ -476,15 +480,12 @@ local function readPowerPercent(barFrame)
 	return math.max(.0, math.min(100.0, yScale * 100.0));
 end;
 
--- Power % at which we release a cast, based on castMode.
+-- Power % at which we release a cast, based on castMode ("short" is time-based, not power-based).
 local function getCastThreshold()
-	if CONFIG.castMode == "short" then
-		return 28.0;
-	end;
 	if CONFIG.castMode == "custom" then
 		return math.max(1.0, math.min(100.0, CONFIG.castPowerCustom));
 	end;
-	return 96.0;
+	return 90.0;
 end;
 
 -- Reel bar-tracking controller tuning (prediction + PWM duty-cycle mix).
@@ -632,16 +633,20 @@ local reelCtrl = ReelController.new();
 
 -- Live macro state.
 local STATE = {
-		phase = "OFF",             -- OFF | CASTING | CASTED | SHAKE | FISHING | DONE
+		phase = "OFF",             -- OFF | CASTING | CASTED | SHAKE | REEQUIP | FISHING | DONE
 		castStartedAt = 0,         -- ms tick when the current cast began charging
 		castReleasedAt = 0,        -- ms tick when the cast was released
 		castBarSeen = false,       -- have we seen the power bar this cast?
-		castThreshold = 96.0,      -- power % to release at (from castMode)
+		castThreshold = 90.0,      -- power % to release at (from castMode)
 		castWaitTimeoutMs = 15000, -- per-cast stall timeout
 		castChargeLastPct = nil,   -- last power reading (to detect a frozen bar)
 		castChargeMotionAt = 0,    -- ms tick the power last moved
 		lastShakedAt = 0,          -- ms tick of the last shake tap
+		shakeCount = 0,            -- Enter taps this cast (for the console prints)
 		shakingIntervalMs = 25,    -- ms between shake taps
+		shakeSeen = false,         -- has the shake prompt appeared this cast?
+		reequipTapsLeft = 0,       -- slot taps remaining in the REEQUIP sequence
+		reequipLastTapAt = 0,      -- ms tick of the last REEQUIP slot tap
 		fishingLostAt = 0,         -- reel-loss timestamp (reserved)
 		completionReached = false, -- did reel progress hit the catch threshold?
 		doneAt = 0,                -- ms tick we entered DONE
@@ -663,6 +668,10 @@ local function startCycle()
 	STATE.castChargeLastPct = nil;
 	STATE.castChargeMotionAt = 0;
 	STATE.lastShakedAt = 0;
+	STATE.shakeCount = 0;
+	STATE.shakeSeen = false;
+	STATE.reequipTapsLeft = 0;
+	STATE.reequipLastTapAt = 0;
 	STATE.fishingLostAt = 0;
 	STATE.completionReached = false;
 	STATE.doneAt = 0;
@@ -673,6 +682,7 @@ local function startCycle()
 	STATE.shakingIntervalMs = CONFIG.shakeIntervalMs;
 	-- UI check: reel up -> reel, shake up -> shake, otherwise cast.
 	STATE.phase = isReeling() and "FISHING" or (shakeUp() and "SHAKE" or "CASTING");
+	STATE.shakeSeen = STATE.phase == "SHAKE";
 end;
 
 -- Drop to an idle phase (default OFF), releasing input and clearing the reel.
@@ -702,12 +712,14 @@ local function updateCasting()
 		releaseMouse();
 		STATE.fishingLostAt = 0;
 		STATE.phase = "FISHING";
+		print("[AutoFish] Detected reel");
 		return;
 	end;
 	-- Shake prompt already up -> shake.
 	if shakeUp() then
 		releaseMouse();
 		STATE.lastShakedAt = 0;
+		STATE.shakeSeen = true;
 		if STATE.castReleasedAt == 0 then
 			STATE.castReleasedAt = tick() * 1000;
 		end;
@@ -717,6 +729,18 @@ local function updateCasting()
 	holdMouse();
 	if STATE.castStartedAt == 0 then
 		STATE.castStartedAt = tick() * 1000;
+	end;
+	-- Short mode: power reads are unreliable, so release purely on hold time.
+	if CONFIG.castMode == "short" then
+		local nowMs = tick() * 1000;
+		STATE.powerPercent = "---";
+		if (nowMs - STATE.castStartedAt) >= CONFIG.castShortHoldMs then
+			releaseMouse();
+			STATE.castReleasedAt = nowMs;
+			STATE.phase = "CASTED";
+			print(string.format("[AutoFish] Casted (short, %dms hold)", CONFIG.castShortHoldMs));
+		end;
+		return;
 	end;
 	local powerBar = getPowerBar();
 	-- No power bar yet: wait briefly, then recast if it never appears.
@@ -742,6 +766,7 @@ local function updateCasting()
 			releaseMouse();
 			STATE.castReleasedAt = now;
 			STATE.phase = "CASTED";
+			print(string.format("[AutoFish] Casted at %.1f%%", power));
 			return;
 		end;
 	else
@@ -780,6 +805,38 @@ local function updateCasted()
 	STATE.phase = "SHAKE";
 end;
 
+-- No shake prompt appeared after the cast: switch to the REEQUIP phase, which
+-- taps the rod slot twice (unequip, then re-equip) before restarting the loop.
+local function beginReequip()
+	releaseMouse();
+	reelCtrl:Reset();
+	STATE.timeouts = STATE.timeouts + 1;
+	STATE.reequipTapsLeft = 2;
+	STATE.reequipLastTapAt = 0;
+	STATE.powerPercent = "";
+	STATE.progressPercent = "";
+	STATE.phase = "REEQUIP";
+end;
+
+-- REEQUIP: tap the rod slot twice with a gap between taps, let the re-equip
+-- register, then start a fresh cast cycle.
+local function updateReequip()
+	releaseMouse();
+	local now = tick() * 1000;
+	if STATE.reequipTapsLeft > 0 then
+		if STATE.reequipLastTapAt == 0 or (now - STATE.reequipLastTapAt) >= 400 then
+			pressSlot(CONFIG.equipSlot);
+			STATE.reequipTapsLeft = STATE.reequipTapsLeft - 1;
+			STATE.reequipLastTapAt = now;
+		end;
+		return;
+	end;
+	-- Give the re-equip a moment to land before recasting.
+	if (now - STATE.reequipLastTapAt) >= 600 then
+		startCycle();
+	end;
+end;
+
 -- SHAKE: tap Enter on an interval until the reel starts (or time out and recast).
 local function updateShake()
 	STATE.powerPercent = "";
@@ -789,12 +846,23 @@ local function updateShake()
 	if isReeling() then
 		STATE.fishingLostAt = 0;
 		STATE.phase = "FISHING";
+		print("[AutoFish] Shook " .. STATE.shakeCount .. " times");
+		print("[AutoFish] Detected reel");
 		return;
 	end;
 	local now = tick() * 1000;
+	if shakeUp() then
+		STATE.shakeSeen = true;
+	end;
 	if STATE.lastShakedAt == 0 or (now - STATE.lastShakedAt) >= STATE.shakingIntervalMs then
 		tapEnter();
+		STATE.shakeCount = STATE.shakeCount + 1;
 		STATE.lastShakedAt = now;
+	end;
+	-- No shake prompt within the window after casting -> re-equip the rod and restart.
+	if not STATE.shakeSeen and STATE.castReleasedAt > 0 and (now - STATE.castReleasedAt) >= CONFIG.noShakeTimeoutMs then
+		beginReequip();
+		return;
 	end;
 	-- Waited too long without a reel -> recast.
 	if STATE.castReleasedAt > 0 and (now - STATE.castReleasedAt) >= STATE.castWaitTimeoutMs then
@@ -822,6 +890,7 @@ local function updateFishing()
 	reelCtrl:Reset();
 	if STATE.completionReached or (progress and progress >= CONFIG.completionThreshold) then
 		STATE.caught = STATE.caught + 1;
+		print("[AutoFish] Catch successful! (" .. STATE.caught .. " total)");
 	else
 		STATE.lost = STATE.lost + 1;
 	end;
@@ -851,6 +920,7 @@ local PHASE_HANDLERS = {
 		CASTING = updateCasting,
 		CASTED = updateCasted,
 		SHAKE = updateShake,
+		REEQUIP = updateReequip,
 		FISHING = updateFishing,
 		DONE = updateDone,
 	};
